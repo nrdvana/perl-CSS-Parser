@@ -1,16 +1,16 @@
 package CSS::Parser;
 use utf8;
 use Moo;
-use v5.14;
+use v5.16;
 
-sub preserve_whitespace { $_[0]{preserve_whitespace} //= 1 }
-sub preserve_comment { $_[0]{preserve_comment} }
+has preserve_whitespace => ( is => 'rw', default => 1 );
+has preserve_comment    => ( is => 'rw' );
 
 # According to https://www.w3.org/TR/css-syntax-3
 sub scan_tokens {
 	my $self= shift;
 	# § 3.3
-	$_[0] =~ s/( \r\n? | \f )/\n/g;
+	$_[0] =~ s/( \r\n? | \f )/\n/xg;
 	$_[0] =~ s/\0/\x{FFFD}/g;
 	# § 4.1
 	pos($_[0])= 0;
@@ -22,9 +22,20 @@ sub scan_tokens {
 		[ \n\t]*
 		  
 		((?| # comment (non)token
-		  /\* (.*?) \*/  (?{ $_self->preserve_comment? [ comment => $2 ] : undef })
+		  /\* .*? \*/  (?{ $_self->preserve_comment? [ 'comment' ] : undef })
 		  
-		  | # at-rule, identifier, function, or 'url(...'
+		  | # CDO token
+		  <!--                                          (?{ [ 'CDO' ] })
+		  | # CDC token
+		  -->                                           (?{ [ 'CDC' ] })
+		  
+		  | # number token
+		  ( [-+]?
+		    (?: [0-9]+ (?: \. [0-9]+ )? | \. [0-9]+ )
+		    (?: [eE] [-+]? [0-9]+ )?
+		  ) (%?)                                        (?{ $3 eq '%'? [ percentage => $2/100 ] : [ number => 0+$2 ] })
+		  
+		  | # at-rule, identifier, or function
 		  ( \@ )?
 		  (?|   # ident first char
 		    --                                          (?{ '--' })
@@ -38,26 +49,13 @@ sub scan_tokens {
 		    | \\ ([0-9A-Fa-f]{1,6}) [ \n\t]*            (?{ $^R.chr(hex($5)) })
 		    | \\ ([^0-9A-Fa-f\n])                       (?{ $^R.$5 })
 		  )*
-		  # If it is not an at-rule, it may begin a function call with '('
-		  (?(1)                                         (?{ [ at => $^R ] })
-		    # If followed by '(', it's a function
-		    | (?: \(
-		  	    (?> # no backtracking after matching '('
-		          # If the function is the literal string "url", continue parsing a URL
-		          (?(?{ lc($^R) ne "url" })             (?{ [ function => $^R ] })
-		            | [ \t\n]* (?|
-		              (?{ '' })     # reset $^R to empty string
-		              (?|
-		                ([^'"()\\ \t\n\0-\x08\x0B\x0E-\x1F\x7F]+)  (?{ $^R.$6 })
-		                | \\ ([0-9A-Fa-f]{1,6}) [ \n\t]*           (?{ $^R.chr(hex($6)) })
-		                | \\ ([^0-9A-Fa-f\n])                      (?{ $^R.$6 })
-		              )*
-		            ) [ \r\n]* \)                       (?{ [ url => $^R ] })
-		          )
-		        )
-		        # If it didn't start with (, then it's just a normal identifier
-		      |                                         (?{ [ ident => $^R ] })
-		      )
+		  # Is it an at-rule?  (capture 2 not null?)
+		  (?(2)                                         (?{ [ at => $^R ] })
+		    |(?: # If followed by '(', it's a function
+		      (?=[ \t\n]* \( )                          (?{ [ function => $^R ] })
+		      | # No ")" following, it's an identifier
+		                                                (?{ [ ident => $^R ] })
+		    )
 		  )
 		  
 		  | # hash-token
@@ -74,28 +72,82 @@ sub scan_tokens {
 		      | \\ ([0-9A-Fa-f]{1,6}) [ \n\t]*          (?{ $^R.chr(hex($2)) })
 		      | \\ ([^0-9A-Fa-f])                       (?{ $^R.$2 })
 		  )*
-		  "                                             (?{ [ string => $^R ] })
+		  (?: "                                         (?{ [ string => $^R ] })
+		    | (?= \Z | \n )                             (?{ [ bad_string => $^R ] })
+		  )
 		  | # singlequote string
 		  '                                             (?{ '' })
 		  (?| ([^'\n\\]+)                               (?{ $^R.$2 })
 		      | \\ ([0-9A-Fa-f]{1,6}) [ \n\t]*          (?{ $^R.chr(hex($2)) })
 		      | \\ ([^0-9A-Fa-f])                       (?{ $^R.$2 })
 		  )*
-		  '                                             (?{ [ string => $^R ] })
+		  (?: '                                         (?{ [ string => $^R ] })
+		    | (?= \Z | \n )                             (?{ [ bad_string => $^R ] })
+		  )
+		
+		  | # tokens which represent themselves
+		  ( [[\]{}():;,] )                               (?{ [ $2 ] })
 		
 		  | # EOF
-		  \Z                                            (?{ 0 })
+		  \Z                                            (?{ [ 'EOF' ] })
+		  
+		  | # anything else is a delim-token
+		  (.)                                           (?{ [ delim => $2 ] })
 		))
 	}xsgc) {
+		# If initial whitespace regex matched,
 		if ($-[1] > $-[0]) {
-			push @ret, [ whitespace => undef, $-[0], $-[1] ]
+			# Make a whitespace node if we're using those.
+			push @ret, [ whitespace => $-[0], $-[1] ]
 				if $self->preserve_whitespace;
 		}
 		next unless defined $^R;
-		last unless $^R;
-		push $^R->@*, $-[1], $+[1]; # append string idx of start and end of token
-		push @ret, $^R;
+		my $token= $^R;
+		splice @$token, 1, 0, $-[1], $+[1]; # append string idx of start and end of token
 		$^R= undef;
+		# If an identifier followed a number with no whitespace inbetween,
+		# it is a 'dimension' token.
+		if ($token->[0] eq 'ident' && $-[1] == $-[0] && @ret && $ret[-1][0] eq 'number') {
+			$ret[-1][0]= 'dimension';
+			$ret[-1][2]= $token->[2];
+			$ret[-1][4]= $token->[3];
+			next;
+		}
+		# Special case for 'url(...)' function that doesn't require quotes around the argument
+		# (yes, this can be wedged into the regex above, but it gets reeealy ugly)
+		elsif ($token->[0] eq 'function' && fc($token->[3]) eq fc('url')
+			&& $_[0] =~ /\G [ \t\n]* \( [ \t\n]* (?= [^'"] )/xsgc
+		) {
+			# § 4.3.6 Consume a URL token
+			$^R= '';
+			if ($_[0] =~ /\G
+				(?|
+				  ([^'"()\\ \t\n\0-\x08\x0B\x0E-\x1F\x7F]+)  (?{ $^R.$1 })
+				  | \\ ([0-9A-Fa-f]{1,6}) [ \n\t]*           (?{ $^R.chr(hex($1)) })
+				  | \\ ([^0-9A-Fa-f\n])                      (?{ $^R.$1 })
+				)*
+				[ \r\n]* \)
+			/xsgc) {
+				$token->[0]= 'url';
+				$token->[2]= pos $_[0];
+				$token->[3]= $^R;
+			} else {
+				# § 4.3.14 Consume the remnants of a bad url
+				$^R= '';
+				$_[0] =~ /\G
+					(?| \\ ( [0-9A-Fa-f]{1,6} ) [ \n\t]*     (?{ $^R.chr(hex($1)) })
+					  | \\ ( [^0-9A-Fa-f\n] )                (?{ $^R.$1 })
+					  | ( [^)]+ )                            (?{ $^R.$1 })
+					)*
+		            \)?
+				/xsgc or die "should always match: '".substr($_[0], pos($_[0]))."'";
+				$token->[0]= 'bad_url';
+				$token->[2]= pos $_[0];
+				$token->[3]= $^R;
+			}
+		}
+		push @ret, $token;
+		last if $token->[0] eq 'EOF';
 	}
 	if (pos($_[0]) != length($_[0])) {
 		push @ret, [ garbage => undef, pos($_[0]), length($_[0]) ];
