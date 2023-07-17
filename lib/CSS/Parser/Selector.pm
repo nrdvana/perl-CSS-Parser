@@ -1,4 +1,4 @@
-package CSS::Selector;
+package CSS::Parser::Selector;
 use Moo;
 
 has name  => ( is => 'ro' );
