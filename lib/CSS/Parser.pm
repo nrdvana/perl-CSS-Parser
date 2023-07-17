@@ -1,10 +1,139 @@
 package CSS::Parser;
 use utf8;
-use Moo;
 use v5.16;
+use Moo;
 
 has preserve_whitespace => ( is => 'rw', default => 1 );
 has preserve_comment    => ( is => 'rw' );
+
+sub parse {
+	my $self= shift;
+	($self->{input}, $self->{location})= @_;
+	$self->{tokens}= $self->scan_tokens($self->{input});
+	$self->{token_pos}= 0;
+	$self->_skip_ws if $self->preserve_whitespace;
+	return $self->_parse_stylesheet;
+}
+sub _token_type  { $_[0]{tokens}[ $_[0]{token_pos} ][0] }
+sub _token_value { $_[0]{tokens}[ $_[0]{token_pos} ][3] }
+sub _eof         { $_[0]{token_pos} < $#{ $_[0]{tokens} } }
+sub _consume_token {
+	my $self= shift;
+	my $t= $self->{tokens}[ $self->{token_pos}++ ];
+	$self->_skip_ws if $self->_preserve_whitespace;
+	return $t;
+}
+sub _skip_ws {
+	my $self= shift;
+	while ($self->{tokens}[ $self->{token_pos} ][0] eq 'whitespace') {
+		++$self->{token_pos};
+	}
+	$self;
+}
+sub _parse_stylesheet {
+	my $self= shift;
+	my $location= $self->{location};
+	my ($error, $rules);
+	unless (eval {
+		$rules= $self->_parse;
+		#push @rules, $self->_parse_rule([])
+		#	while !$self->_eof;
+		1
+	}) { $error= $@ }
+	return CSS::Parser::Stylesheet->new(
+		location => $location,
+		rules => $rules,
+		source => $self->{input},
+		tokens => $self->{tokens},
+		token_pos => $self->{token_pos},
+		error => $error,
+	);
+}
+
+sub _parse {
+	my $self= shift;
+	my %token_code= (
+		at          => 'a', '{' => '{', '}' => '}',
+		ident       => 'i', '(' => '(', ')' => ')',
+		string      => 's', '[' => '[', ']' => ']',
+		bad_string  => 's', ';' => ';', ':' => ':',
+		number      => 'n', ',' => ',',
+		hash        => 'h',
+		percentage  => 'p',
+		dimension   => 'd',
+		url         => 'u',
+		bad_url     => 'u',
+		function    => 'f',
+		delimiter   => 'l',
+	);
+	local our $_self= $self;
+	local our @tokens= grep $_->[0] ne 'comment' && $_->[0] ne 'whitespace' && $_->[0] ne 'EOF', @{ $self->{tokens} };
+	local our @argstack;
+	my @result;
+	my $tok_seq= join '', map +($token_code{$_->[0]} // die "uncoded $_->[0]"), @tokens;
+	while ($tok_seq =~ m{
+		(?(DEFINE)
+		  (?<VALUE>
+		    [shnupdi]                               (?{ $tokens[-1+pos] })
+		    | (?= f ) (?&FUNCTIONCALL)              # already sets $^R
+		  )
+		  (?<FUNCTIONCALL>
+		    f \(
+		    (?:                                     (?{ local $argstack[$#argstack+1]= [ function_call => $tokens[-2+pos] ]; })
+		        (?= [shnupdif] ) (?&VALUE)          (?{ push @{$argstack[-1]}, $^R; })
+		        (?: ,
+		            (?= [shnupdif] ) (?&VALUE)      (?{ push @{$argstack[-1]}, $^R; })
+		        )*
+		    )
+		    \)                                      (?{ pop @argstack; })
+		  )
+		  (?<PROPERTY>
+		    i :                                     (?{ local $argstack[$#argstack+1]= [ style_property => $tokens[-2+pos] ]; })
+		    (?:
+		      (?= [shnupdif] ) (?&VALUE)            (?{ push @{$argstack[-1]}, $^R; })
+		    )+                                      (?{ pop @argstack; })
+		  )
+		  (?<SELECTOR>
+		    [il]                                    (?{ local $argstack[$#argstack+1]= [ selector => $tokens[-1+pos] ]; })
+		    (?:
+		      [il]                                  (?{ push @{$argstack[-1]}, $tokens[-1+pos]; })
+		    )*                                      (?{ pop @argstack; })
+		  )
+		  (?<STYLERULE>                             (?{ local $argstack[$#argstack+1]= [ style_rule => [], [] ]; })
+		    (?&SELECTOR)                            (?{ push @{$argstack[-1][1]}, $^R; })
+		    ( , (?&SELECTOR)                        (?{ push @{$argstack[-1][1]}, $^R; })
+		    )*
+		    \{
+		      (?&PROPERTY)                          (?{ push @{$argstack[-1][2]}, $^R; })
+		      (?:
+		        ; (?= i ) (?&PROPERTY)              (?{ push @{$argstack[-1][2]}, $^R; })
+		      )*
+		      ;?
+		    \}                                      (?{ pop @argstack; })
+		  )
+		  (?<ATRULE>
+		    a                                       (?{ local $argstack[$#argstack+1]= [ at_rule => $^R ]; })
+		    (?:
+		      (?= [shnupdif] )(?&VALUE)             (?{ push @{$argstack[-1]}, $^R; })
+		    )*
+		    (?:
+		      \{                                    (?{ push @{$argstack[-1]}, []; })
+		        (?:
+		          (?&RULE)                          (?{ push @{$argstack[-1][-1]}, $^R; })
+		        )*
+		      \}
+		      | ;
+		    )                                       (?{ pop @argstack; })
+		  )
+		  (?<RULE> (?= a ) (?&ATRULE) | (?&STYLERULE) )
+		)
+		(?&RULE)
+	}xsgc) {
+		#use DDP; &p($^R);
+		push @result, $^R;
+	}
+	return \@result;
+}
 
 # According to https://www.w3.org/TR/css-syntax-3
 sub scan_tokens {
@@ -115,7 +244,7 @@ sub scan_tokens {
 		}
 		# Special case for 'url(...)' function that doesn't require quotes around the argument
 		# (yes, this can be wedged into the regex above, but it gets reeealy ugly)
-		elsif ($token->[0] eq 'function' && fc($token->[3]) eq fc('url')
+		elsif ($token->[0] eq 'function' && lc($token->[3]) eq 'url'
 			&& $_[0] =~ /\G [ \t\n]* \( [ \t\n]* (?= [^'"] )/xsgc
 		) {
 			# § 4.3.6 Consume a URL token
@@ -150,9 +279,12 @@ sub scan_tokens {
 		last if $token->[0] eq 'EOF';
 	}
 	if (pos($_[0]) != length($_[0])) {
-		push @ret, [ garbage => undef, pos($_[0]), length($_[0]) ];
+		push @ret,
+			[ garbage => pos($_[0]), length($_[0]) ],
+			[ EOF => length($_[0]), length($_[0]) ];
 	}
 	return \@ret;
 }
 
+require CSS::Parser::Stylesheet;
 1;
