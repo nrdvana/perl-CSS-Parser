@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 use Test::More;
-use CSS::Parser;
+use CSS::Parser::TokenSequence;
 
 my @tests= (
 	# Comments do not return tokens by default, but they do break whitespace tokens
@@ -100,9 +100,12 @@ for (@tests) {
 	my ($name, $ws, $comment, $css, $tokens)= @$_;
 	subtest $name => sub {
 		note $css;
-		my $parser= CSS::Parser->new(preserve_whitespace => $ws, preserve_comment => $comment);
-		my @parsed= map +[ $_->[0], substr($css, $_->[1], $_->[2] - $_->[1]), @{$_}[3..$#$_] ],
-			$parser->scan_tokens($css)->@*;
+		my @parsed= @{ CSS::Parser::TokenSequence->scan_tokens($css) };
+		my $prev= length($css);
+		($_->[0], $_->[1], $prev)= ($_->[1], substr($css, $_->[0], $prev-$_->[0]), $_->[0])
+			for reverse @parsed;
+		@parsed= grep { $_->[0] ne 'comment'    } @parsed unless $comment;
+		@parsed= grep { $_->[0] ne 'whitespace' } @parsed unless $ws;
 		for (0..$#$tokens) {
 			is_deeply( $parsed[$_], $tokens->[$_], "$parsed[$_][0] = $tokens->[$_][0]" )
 				or diag explain [ $parsed[$_], $tokens->[$_] ];

@@ -3,25 +3,93 @@ use utf8;
 use v5.16;
 use Moo;
 use Scalar::Util 'looks_like_number';
+use Carp;
+
+=head1 DESCRIPTION
+
+A TokenSequence takes a buffer of characters and parses the boundaries of tokens.
+It allows you to iterate the tokens, but also alter and replace tokens while
+preserving the whitespae in the original buffer.
+
+=head1 ATTRIBUTES
+
+=head2 buffer
+
+The input buffer of characters.  Read-only accessor, but you can append to it
+using L</feed> and perform token-level edits using L</splice>.
+
+=head2 tokens
+
+An arrayref of Token objects.  (this is actually instantiated on demand via
+a tied array, so there is some overhead in using this property)
+
+=head2 C<< ->[...] >>  (Array access)
+
+You may access the tokens of the sequence using arrayref element notation.
+
+=cut
+
+use overload '@{}' => sub { $_[0]->tokens };
+
+# token: [ $pos, $type, $value ]
+use constant {
+	TOKEN_POS   => 0,
+	TOKEN_TYPE  => 1,
+	TOKEN_VALUE => 2,
+	TOKEN_UNIT  => 3,
+};
 
 has buffer          => ( is => 'rwp', default => '' );
+has _tok            => ( is => 'ro',  default => sub {[]} );
+has tokens          => ( is => 'lazy' );
 
-# token: [ $type, $value, $src_pos, $src_len, $tok_idx ]
-use constant {
-	TOKEN_TYPE => 0,
-	TOKEN_VALUE => 1,
-	TOKEN_SRC_POS => 2,
-	TOKEN_SRC_LEN => 3,
-	TOKEN_IDX => 4,
-};
-has tokens          => ( is => 'rwp', default => sub{[]} );
-has with_whitespace => ( is => 'ro' );
-has with_comments   => ( is => 'ro' );
+sub _build_tokens {
+	my $self= shift;
+	tie my @tie, 'CSS::Parser::TokenSequence::_Tie', $self;
+	return \@tie;
+}
+sub CSS::Parser::TokenSequence::_Tie::TIEARRAY  {
+	my ($class, $self)= @_;
+	Scalar::Util::weaken($self);
+	bless \$self, $class;
+}
+sub CSS::Parser::TokenSequence::_Tie::FETCH     { ${$_[0]}->token($_[1]) }
+sub CSS::Parser::TokenSequence::_Tie::STORE     { ${$_[0]}->splice($_[1], 1, $_[2]) }
+sub CSS::Parser::TokenSequence::_Tie::FETCHSIZE { scalar @{ ${$_[0]}->_tok } }
+sub CSS::Parser::TokenSequence::_Tie::STORESIZE {
+	my $self= ${$_[0]};
+	my $count= $_[1];
+	my $cur= scalar @{$self->{_tok}};
+	if ($count > $cur) {
+		$self->splice($cur, 0, (undef)x($count-$cur));
+	} else {
+		$self->splice($count, $cur-$count);
+	}
+}
+sub CSS::Parser::TokenSequence::_Tie::EXTEND    {}
+sub CSS::Parser::TokenSequence::_Tie::EXISTS    { defined ${$_[0]}->_tok->[$_[1]] }
+sub CSS::Parser::TokenSequence::_Tie::DELETE    { die "unimplemented" }
+sub CSS::Parser::TokenSequence::_Tie::CLEAR     { @{ ${$_[0]}->_tok }= () }
+sub CSS::Parser::TokenSequence::_Tie::PUSH {
+	my $self= ${shift()};
+	$self->splice( scalar @{$self->_tok}, 0, @_ );
+}
+sub CSS::Parser::TokenSequence::_Tie::POP       { ${$_[0]}->splice( -1, 1 ) }
+sub CSS::Parser::TokenSequence::_Tie::SHIFT     { ${$_[0]}->splice( 0, 1 ) }
+sub CSS::Parser::TokenSequence::_Tie::UNSHIFT   { ${shift()}->splice(0, 0, @_) }
+sub CSS::Parser::TokenSequence::_Tie::SPLICE    { ${shift()}->splice(@_) }
+
+sub CSS::Parser::TokenSequence::TokenProxy::sequence   { $_[0][0] }
+sub CSS::Parser::TokenSequence::TokenProxy::index      { $_[0][1] }
+sub CSS::Parser::TokenSequence::TokenProxy::type       { $_[0][0]{_tok}[$_[0][1]][TOKEN_TYPE] }
+sub CSS::Parser::TokenSequence::TokenProxy::value      { $_[0][0]{_tok}[$_[0][1]][TOKEN_VALUE] }
+sub CSS::Parser::TokenSequence::TokenProxy::source_pos { $_[0][0]{_tok}[$_[0][1]][TOKEN_POS] }
+sub CSS::Parser::TokenSequence::TokenProxy::source     { $_[0][0]->_token_source($_[0][1]); }
 
 sub BUILD {
 	my ($self)= @_;
-	push @{$self->tokens}, @{ $self->scan_tokens($self->{buffer}) }
-		if length $self->buffer;
+	@{$self->_tok}= $self->scan_tokens($self->{buffer})
+		if length $self->buffer && !@{$self->_tok};
 }
 
 sub feed {
@@ -29,31 +97,52 @@ sub feed {
 	my $pos= pos($self->{buffer}) // 0;
 	$self->_set_buffer($self->{buffer} . $chars);
 	pos($self->{buffer})= $pos;
-	push @{$self->tokens}, @{ $self->scan_tokens($self->{buffer}) };
+	push @{$self->_tok}, @{ $self->scan_tokens($self->{buffer}) };
 	return $self;
 }
 
-sub token_at_src_pos {
+sub token {
+	my ($self, $idx)= @_;
+	return undef unless $idx >= 0 && $idx < @{ $self->_tok };
+	bless [ $self, $idx ], 'CSS::Parser::TokenSequence::TokenProxy';
+}
+
+sub _tok_at_pos {
 	my ($self, $pos)= @_;
 	# Binary search
-	my $t= $self->tokens;
+	my $t= $self->_tok;
 	my ($min, $max, $mid)= (0, $#$t);
 	while ($min < $max) {
 		$mid= ($min+$max+1) >> 1;
-		if ($pos < $t->[$mid][TOKEN_SRC_POS]) {
+		if ($pos < $t->[$mid][TOKEN_POS]) {
 			$max= $mid-1;
 		} else {
 			$min= $mid;
 		}
 	}
 	return undef unless $min == $max;
-	my $ofs= $pos - $t->[$min][TOKEN_SRC_POS];
-	return $ofs >= 0 && $ofs < $t->[$min][TOKEN_SRC_LEN]? $t->[$min] : undef;
+	my $tok_lim= $min < $#$t? $t->[$min+1][TOKEN_POS] : length $self->buffer;
+	return undef unless $pos >= $t->[$min][TOKEN_POS] && $pos < $tok_lim;
+	return $min;
+}
+
+sub token_at_pos {
+	my ($self, $pos)= @_;
+	my $idx= $self->_tok_at_pos($pos);
+	return defined $idx? $self->token($idx) : undef;
+}
+
+sub _token_source {
+	my ($self, $idx)= @_;
+	my $t= $self->_tok;
+	my $tok_pos= $t->[$idx][TOKEN_POS];
+	my $tok_lim= $idx == $#$t? length($self->buffer) : $t->[$idx+1][TOKEN_POS];
+	substr $self->buffer, $tok_pos, $tok_lim-$tok_pos;
 }
 
 =head2 splice
 
-  @removed= $tok_seq->splice($first_token, $last_token, @replacement);
+  @removed= $tok_seq->splice($first_token, $until_token, @replacement);
   @removed= $tok_seq->splice($first_token, $count, @replacement);
   @removed= $tok_seq->splice($token_idx, $count, @replacement);
 
@@ -73,95 +162,94 @@ throw an exception.
 =cut
 
 sub splice {
-	my ($self, $first, $last, @add)= @_;
-	my $n_tok= scalar @{ $self->tokens };
-	my ($prev, $next);
+	my ($self, $first, $count, @add)= @_;
+	my $tok= $self->_tok;
+	my $n_tok= scalar @$tok;
 	defined $first
 		or croak "Require \$first_token parameter to splice";
 	if (looks_like_number($first)) {
 		my $idx= $first < 0? $n_tok + $first : $first;
 		croak "Index out of bounds: $first" if $idx < 0;
-		carp "Index out of bounds: $first" if $idx > $n_tok && defined $last;
-		$first= $idx >= $n_tok? undef : $self->tokens->[$idx];
+		carp "Index out of bounds: $first" if $idx > $n_tok && defined $count;
+		$first= $idx > $n_tok? $n_tok : $idx;
 	} else {
-		$self->tokens->[$first->[TOKEN_IDX]] == $first
-			or croak "\$first_token is not a member of this sequence";
+		croak "\$first_token is not a member of this sequence"
+			unless $first->sequence == $self;
+		$first= $first->index;
 	}
-	if (!defined $first) {
-		$last= undef;
-	} elsif (!defined $last) {
-		$last= $self->tokens->[-1];
-	} elsif (looks_like_number($last)) {
-		my $idx= $last < 0? $n_tok + $last : $first->[TOKEN_IDX] + $last;
-		$last= $idx >= $n_tok? $self->tokens->[-1]
-			: $idx < $first->[TOKEN_IDX]? $first
-			: $self->tokens->[$idx];
+	if (!defined $count) {
+		$count= $n_tok-$first;
+	} elsif (looks_like_number($count)) {
+		# if negative, treat as offset from end, else treat it as a count
+		$count= $n_tok - $first + $count if $count < 0;
 	} else {
-		$self->tokens->[$last->[TOKEN_IDX]] == $last
-			or croak "\$last_token is not a member of this sequence";
-		$last= $first if $last->[TOKEN_IDX] < $first->[TOKEN_IDX];
+		croak "\$until_token is not a member of this sequence"
+			unless $count->sequence == $self;
+		$count= $count->index - $first;
 	}
-	my $buf_add= '';
-	my $token_span_from= undef;
-	for (my $i= 0; $i < @add; $i++) {
-		if (ref $add[$i]) {
-			$token_span_from //= $i;
+	$count= 0 if $count < 0;
+	
+	my $add_buf= '';
+	for (@add) {
+		if (ref and ref->can('source')) {
+			$add_buf .= $_->source;
 		} else {
-			if (defined $oken_span_from) {
-				$buff_add .= $self->get_token_source(@add[$token_span_from .. $i]);
-				$token_span_from= undef;
-			}
-			$buff_add .= $add[$i];
-			my @new_tok= $self->scan_tokens($add[$i]);
-			splice(@add, $i, 1, @new_tok);
-			$i += @new_tok - 1;
+			$add_buf .= $_;
 		}
 	}
-	if (defined $token_span_from) {
-		$buff_add .= $self->get_token_source(@add[$token_span_from .. $#add]);
+	my @add_tok= length $add_buf? $self->scan_tokens($add_buf) : ();
+	my $replace_pos= $tok->[$first][TOKEN_POS];
+	my $replace_lim= $first+$count == $n_tok? length($self->buffer) : $tok->[$first+$count][TOKEN_POS];
+
+	# Now verify that the buffer replacement didn't damage the token before or after the insertion point.
+	if ($first > 0) {
+		my $prev_pos= $tok->[$first-1][TOKEN_POS];
+		my $prev_len= $replace_pos-$prev_pos;
+		my $first_len= @add_tok > 1? $add_tok[1][TOKEN_POS] : length($add_buf);
+		my $tmp_buf= substr($self->buffer, $prev_pos, $prev_len)
+			. substr($add_buf, 0, $first_len);
+		my @tmp_tok= $self->scan_tokens($tmp_buf);
+		unless (@tmp_tok == 2
+			&& $tmp_tok[0][TOKEN_TYPE]  eq $tok->[$first-1][TOKEN_TYPE]
+			&& $tmp_tok[0][TOKEN_VALUE] eq $tok->[$first-1][TOKEN_VALUE]
+			&& $tmp_tok[1][TOKEN_TYPE]  eq $add_tok[0][TOKEN_TYPE]
+			&& $tmp_tok[1][TOKEN_VALUE] eq $add_tok[0][TOKEN_VALUE]
+			&& $tmp_tok[1][TOKEN_POS]   == $prev_len
+		) {
+			croak "After replacement, previous token would parse differently"
+				." (".$tok->[$first-1][TOKEN_TYPE].", '".$tok->[$first-1][TOKEN_VALUE]."')";
+		}
 	}
-	# Now verify that parsing the injected buffer will result in the same sequence of tokens.
-	# Include one token before and after the insertion point.
-	my $prev= !$first? $self->tokens->[-1]
-		: $first->[TOKEN_IDX]? $self->tokens->[$first->[TOKEN_IDX]-1]
-		: undef;
-	if ($prev) {
-		$buf_add= substr($self->buffer, $prev->[TOKEN_SRC_POS], $prev->[TOKEN_SRC_LEN]) . $buf_add;
-		unshift @add, $prev;
+	if ($first+$count < $n_tok) {
+		my $last_pos= $add_tok[-1][TOKEN_POS];
+		my $last_len= length($add_buf) - $last_pos;
+		my $next_lim= $first+$count+1 == $n_tok? length($self->buffer) : $tok->[$first+$count+1][TOKEN_POS];
+		my $tmp_buf= substr($add_buf, $last_pos) . substr($self->buffer, $replace_lim, $next_lim-$replace_lim);
+		my @tmp_tok= $self->scan_tokens($tmp_buf);
+		unless (@tmp_tok == 2
+			&& $tmp_tok[0][TOKEN_TYPE]  eq $add_tok[-1][TOKEN_TYPE]
+			&& $tmp_tok[0][TOKEN_VALUE] eq $add_tok[-1][TOKEN_VALUE]
+			&& $tmp_tok[1][TOKEN_TYPE]  eq $tok->[$first+$count][TOKEN_TYPE]
+			&& $tmp_tok[1][TOKEN_VALUE] eq $tok->[$first+$count][TOKEN_VALUE]
+			&& $tmp_tok[1][TOKEN_POS]   == $last_len
+		) {
+			croak "After replacement, next token would parse differently"
+				." (".$tok->[$first+$count][TOKEN_TYPE].", '".$tok->[$first+$count][TOKEN_VALUE]."')";
+		}
 	}
-	my $next= !$last || $last->[TOKEN_IDX] == $n_tok-1? undef
-		: $self->tokens->[$last->[TOKEN_IDX]+1];
-	if ($next) {
-		$buf_add .= substr($self->buffer, $next->[TOKEN_SRC_POS], $next->[TOKEN_SRC_LEN]);
-		push @add, $next;
-	}
-	my @rep_tokens= $self->scan_tokens($buf_add);
-	for (my ($i, $max)= (0, @add < @rep_tokens? $#add : $#rep_tokens); $i <= $max; $i++) {
-		croak "After replacement, token $i (".$add[$i][TOKEN_TYPE].") would parse differently"
-			if $add[$i][TOKEN_TYPE] ne $rep_tokens[$i][TOKEN_TYPE]
-			or $add[$i][TOKEN_SRC_LEN] ne $rep_tokens[$i][TOKEN_SRC_LEN];
-	}
-	croak "After replacement, parse would return extra token ".$rep_token[$#add+1][TOKEN_TYPE]
-		if @add < @rep_token;
-	croak "After replacement, parse lacks token ".$add[$#rep_token+1][TOKEN_TYPE]
-		if @add > @rep_token;
 	# looks good, merge them
-	my $reparse_from= $prev? $prev->[TOKEN_SRC_POS] : 0;
-	my $reparse_until= $next? $next->[TOKEN_SRC_POS]+$next->[TOKEN_SRC_LEN] : length $self->buffer;
-	substr($self->{buffer}, $reparse_from, $reparse_until-$reparse_from, $buf_add);
-	CORE::splice(@{$self->tokens}, $prev->[TOKEN_IDX], $next->[TOKEN_IDX]-$prev->[TOKEN_IDX], @rep_tokens);
-	for (@rep_tokens) {
-		$_->[TOKEN_IDX] += $prev->[TOKEN_IDX];
-		$_->[TOKEN_SRC_POS] += $prev->[TOKEN_SRC_POS];
-	}
-	for ($next->[TOKEN_IDX] .. $#{$self->tokens}) {
-		$_->[TOKEN_IDX] += (@rep_tokens - ($next->[TOKEN_IDX] - $prev->[TOKEN_IDX]));
-		$_->[TOKEN_SRC_POS] += ($rep_tokens[-1][TOKEN_SRC_POS] - $next->[TOKEN_SRC_POS]);
-	}
+	substr($self->{buffer}, $replace_pos, $replace_lim-$replace_pos, $add_buf);
+	my @removed= CORE::splice(@$tok, $first, $count, @add_tok);
+	$_->[TOKEN_POS] += $replace_pos
+		for @add_tok;
+	my $ofs= length($add_buf) - ($replace_lim-$replace_pos);
+	$_->[TOKEN_POS] += $ofs
+		for @add_tok;
+	return @removed;
 }
 
 sub scan_tokens {
-	my $self= shift;
+	my $class= shift;
 	# According to https://www.w3.org/TR/css-syntax-3
 	# § 3.3
 	$_[0] =~ s/( \r\n? | \f )/\n/xg;
@@ -169,15 +257,13 @@ sub scan_tokens {
 	# § 4.1
 	pos($_[0]) //= 0;
 	my @ret;
-	my $with_whitespace= $self->with_whitespace;
-	local our $_with_comments= $self->with_commnts; # global, for compiled regex
 	local $^R= undef;
 	while($_[0] =~ m{\G
 		# as an optimization, skip leading whitespace and generate the token later.
 		[ \n\t]*
 		  
 		((?| # comment (non)token
-		  /\* .*? \*/  (?{ $_with_comments [ 'comment' ] : undef })
+		  /\* .*? \*/                                   (?{ [ 'comment' ] })
 		  
 		  | # CDO token
 		  <!--                                          (?{ [ 'CDO' ] })
@@ -253,24 +339,22 @@ sub scan_tokens {
 		# If initial whitespace regex matched,
 		if ($-[1] > $-[0]) {
 			# Make a whitespace node if we're using those.
-			push @ret, [ whitespace => $-[0], $-[1] ]
-				if $with_whitespace;
+			push @ret, [ $-[0] => 'whitespace' ]
 		}
 		next unless defined $^R;
 		my $token= $^R;
-		splice @$token, 1, 0, $-[1], $+[1]; # append string idx of start and end of token
+		unshift @$token, $-[1];
 		$^R= undef;
 		# If an identifier followed a number with no whitespace inbetween,
 		# it is a 'dimension' token.
-		if ($token->[0] eq 'ident' && $-[1] == $-[0] && @ret && $ret[-1][0] eq 'number') {
-			$ret[-1][0]= 'dimension';
-			$ret[-1][2]= $token->[2];
-			$ret[-1][4]= $token->[3];
+		if ($token->[TOKEN_TYPE] eq 'ident' && $-[1] == $-[0] && @ret && $ret[-1][TOKEN_TYPE] eq 'number') {
+			$ret[-1][TOKEN_TYPE]= 'dimension';
+			$ret[-1][TOKEN_UNIT]= $token->[TOKEN_VALUE];
 			next;
 		}
 		# Special case for 'url(...)' function that doesn't require quotes around the argument
 		# (yes, this can be wedged into the regex above, but it gets reeealy ugly)
-		elsif ($token->[0] eq 'function' && lc($token->[3]) eq 'url'
+		elsif ($token->[TOKEN_TYPE] eq 'function' && lc($token->[TOKEN_VALUE]) eq 'url'
 			&& $_[0] =~ /\G [ \t\n]* \( [ \t\n]* (?= [^'"] )/xsgc
 		) {
 			# § 4.3.6 Consume a URL token
@@ -283,9 +367,8 @@ sub scan_tokens {
 				)*
 				[ \r\n]* \)
 			/xsgc) {
-				$token->[0]= 'url';
-				$token->[2]= pos $_[0];
-				$token->[3]= $^R;
+				$token->[TOKEN_TYPE]= 'url';
+				$token->[TOKEN_VALUE]= $^R;
 			} else {
 				# § 4.3.14 Consume the remnants of a bad url
 				$^R= '';
@@ -296,18 +379,17 @@ sub scan_tokens {
 					)*
 		            \)?
 				/xsgc or die "should always match: '".substr($_[0], pos($_[0]))."'";
-				$token->[0]= 'bad_url';
-				$token->[2]= pos $_[0];
-				$token->[3]= $^R;
+				$token->[TOKEN_TYPE]= 'bad_url';
+				$token->[TOKEN_VALUE]= $^R;
 			}
 		}
 		push @ret, $token;
-		last if $token->[0] eq 'EOF';
+		last if $token->[TOKEN_TYPE] eq 'EOF';
 	}
 	if (pos($_[0]) != length($_[0])) {
 		push @ret,
-			[ garbage => pos($_[0]), length($_[0]) ],
-			[ EOF => length($_[0]), length($_[0]) ];
+			[ pos($_[0]) => 'garbage' ],
+			[ length($_[0]) => 'EOF' ];
 	}
 	return \@ret;
 }
