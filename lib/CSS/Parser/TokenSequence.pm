@@ -88,7 +88,7 @@ sub CSS::Parser::TokenSequence::TokenProxy::source     { $_[0][0]->_token_source
 
 sub BUILD {
 	my ($self)= @_;
-	@{$self->_tok}= $self->scan_tokens($self->{buffer})
+	@{$self->_tok}= @{$self->scan_tokens($self->{buffer})}
 		if length $self->buffer && !@{$self->_tok};
 }
 
@@ -197,7 +197,8 @@ sub splice {
 			$add_buf .= $_;
 		}
 	}
-	my @add_tok= length $add_buf? $self->scan_tokens($add_buf) : ();
+	my @add_tok= length $add_buf? @{$self->scan_tokens($add_buf)} : ();
+	pop @add_tok; # remove EOF
 	my $replace_pos= $tok->[$first][TOKEN_POS];
 	my $replace_lim= $first+$count == $n_tok? length($self->buffer) : $tok->[$first+$count][TOKEN_POS];
 
@@ -208,7 +209,8 @@ sub splice {
 		my $first_len= @add_tok > 1? $add_tok[1][TOKEN_POS] : length($add_buf);
 		my $tmp_buf= substr($self->buffer, $prev_pos, $prev_len)
 			. substr($add_buf, 0, $first_len);
-		my @tmp_tok= $self->scan_tokens($tmp_buf);
+		my @tmp_tok= @{$self->scan_tokens($tmp_buf)};
+		pop @tmp_tok; # remove EOF
 		unless (@tmp_tok == 2
 			&& $tmp_tok[0][TOKEN_TYPE]  eq $tok->[$first-1][TOKEN_TYPE]
 			&& $tmp_tok[0][TOKEN_VALUE] eq $tok->[$first-1][TOKEN_VALUE]
@@ -225,12 +227,13 @@ sub splice {
 		my $last_len= length($add_buf) - $last_pos;
 		my $next_lim= $first+$count+1 == $n_tok? length($self->buffer) : $tok->[$first+$count+1][TOKEN_POS];
 		my $tmp_buf= substr($add_buf, $last_pos) . substr($self->buffer, $replace_lim, $next_lim-$replace_lim);
-		my @tmp_tok= $self->scan_tokens($tmp_buf);
+		my @tmp_tok= @{$self->scan_tokens($tmp_buf)};
+		pop @tmp_tok; # remove EOF
 		unless (@tmp_tok == 2
 			&& $tmp_tok[0][TOKEN_TYPE]  eq $add_tok[-1][TOKEN_TYPE]
-			&& $tmp_tok[0][TOKEN_VALUE] eq $add_tok[-1][TOKEN_VALUE]
+			&& ($tmp_tok[0][TOKEN_VALUE]//'') eq ($add_tok[-1][TOKEN_VALUE]//'')
 			&& $tmp_tok[1][TOKEN_TYPE]  eq $tok->[$first+$count][TOKEN_TYPE]
-			&& $tmp_tok[1][TOKEN_VALUE] eq $tok->[$first+$count][TOKEN_VALUE]
+			&& ($tmp_tok[1][TOKEN_VALUE]//'') eq ($tok->[$first+$count][TOKEN_VALUE]//'')
 			&& $tmp_tok[1][TOKEN_POS]   == $last_len
 		) {
 			croak "After replacement, next token would parse differently"
@@ -244,7 +247,7 @@ sub splice {
 		for @add_tok;
 	my $ofs= length($add_buf) - ($replace_lim-$replace_pos);
 	$_->[TOKEN_POS] += $ofs
-		for @add_tok;
+		for @{$tok}[$first+@add_tok .. $#$tok];
 	return @removed;
 }
 
